@@ -128,44 +128,61 @@ def pct(x, d=1):
 
 
 # --------------------------------------------------------------------------- data
-@st.cache_data(show_spinner="Loading simulated data… / 正在加载模拟数据…")
-def get_data():
-    if not (A.DATA_DIR / "station_results.csv").exists():
-        import generate_data
+def _data_is_current() -> bool:
+    import generate_data
+    stamp = A.DATA_DIR / "_generator_hash.txt"
+    return ((A.DATA_DIR / "station_results.csv").exists() and stamp.exists()
+            and stamp.read_text().strip() == generate_data.generator_hash())
+
+
+def ensure_data() -> str:
+    """(Re)generate the CSVs if they are missing or were made by an older generator."""
+    import generate_data
+    if not _data_is_current():
         generate_data.main(str(A.DATA_DIR))
+    return generate_data.generator_hash()
+
+
+@st.cache_data(show_spinner="Loading simulated data… / 正在加载模拟数据…")
+def _load(version: str):
     return A.load_data()
 
 
+def get_data():
+    return _load(ensure_data())  # cache is keyed on the generator version
+
+
 @st.cache_data
-def get_trend():
+def get_trend(v: str = ""):
     d = get_data()
     return A.weekly_trend(d["units"], d["sr"])
 
 
 @st.cache_data
-def get_hints(w0: int, w1: int):
+def get_hints(w0: int, w1: int, v: str = ""):
     d = get_data()
     sr = d["sr"][d["sr"]["week"].between(w0, w1)]
     return A.root_cause_hints(sr)
 
 
 @st.cache_data
-def get_factors(w0: int, w1: int):
+def get_factors(w0: int, w1: int, v: str = ""):
     d = get_data()
     return A.factor_association(d["units"][d["units"]["week"].between(w0, w1)])
 
 
 @st.cache_data
-def get_anomalies(z: float):
+def get_anomalies(z: float, v: str = ""):
     return A.detect_anomalies(get_data()["units"], z_thresh=z)
 
 
 @st.cache_data
-def get_subgroups(param: str):
+def get_subgroups(param: str, v: str = ""):
     return A.spc_subgroups(get_data()["units"], param)
 
 
-DATA = get_data()
+VERSION = ensure_data()  # every cached result below is keyed on this
+DATA = _load(VERSION)
 UNITS, SR, FIXES, DOE = DATA["units"], DATA["sr"], DATA["fixes"], DATA["doe"]
 WEEKS = sorted(UNITS["week"].unique())
 PHASE_OF = UNITS.groupby("week")["phase"].first().to_dict()
@@ -200,7 +217,7 @@ def spec_label(param):
 def page_overview():
     st.title(T("Product X — Yield Ramp Overview", "产品 X — 良率爬坡总览"))
     banner()
-    trend = get_trend()
+    trend = get_trend(VERSION)
     c0, _ = st.columns([1, 3])
     wk = c0.select_slider(T("Week shown in KPI cards", "KPI 卡片显示的周"), options=WEEKS, value=WEEKS[-1],
                           format_func=lambda w: T(f"Week {w} ({PHASE_OF[w]})", f"第 {w} 周（{i18n.phase(PHASE_OF[w], 'zh')}）"))
@@ -481,7 +498,7 @@ def page_spc():
     bw = c3.select_slider(T("Control limits computed from", "控制限计算基准周"), options=WEEKS, value=(1, 1),
                           format_func=wk_label)
     spec = A.SPECS[param]
-    sg = get_subgroups(param)
+    sg = get_subgroups(param, VERSION)
     sg = sg[sg["line"] == line].reset_index(drop=True)
     lim = A.control_limits(sg[sg["week"].between(*bw)])
     flags = A.western_electric(sg["xbar"].to_numpy(), lim["cl"], lim["sigma"])
@@ -586,7 +603,7 @@ def page_ai():
         c1, _ = st.columns([1, 2])
         z = c1.slider(T("Sensitivity (flag if yield is this many σ below expected)", "灵敏度（良率低于预期多少个 σ 时标记）"),
                       2.5, 5.0, 3.0, 0.5)
-        an = get_anomalies(z)
+        an = get_anomalies(z, VERSION)
         if an.empty:
             st.success(T("No anomalies at this threshold.", "在此阈值下没有异常。"))
         else:
@@ -657,7 +674,7 @@ def page_ai():
         c1, _ = st.columns([1.2, 2])
         w0, w1 = c1.select_slider(T("Analyse weeks", "分析的周"), options=WEEKS, value=(WEEKS[0], WEEKS[-1]),
                                   format_func=wk_label, key="rc_weeks")
-        hints = get_hints(w0, w1)
+        hints = get_hints(w0, w1, VERSION)
         if not hints:
             st.info(T("No factor stands out beyond the normal learning curve in this window — "
                       "consistent with the fixes having held.",
@@ -673,7 +690,7 @@ def page_ai():
                      "只显示校正后风险 ≥ 2 倍的提示。"))
 
         st.subheader(T("Which factors are associated with final failure?", "哪些因素与最终失效相关？"))
-        fa = get_factors(w0, w1)
+        fa = get_factors(w0, w1, VERSION)
         fa = fa.sort_values("strength")
         fnames = [i18n.FACTOR_ZH.get(f, f) if ZH else f for f in fa["factor"]]
         levels = [tr_text(v) for v in fa["worst_level"]]
@@ -832,7 +849,7 @@ def page_program():
     st.write("")
 
     st.subheader(T("Success metrics", "成功指标"))
-    trend = get_trend()
+    trend = get_trend(VERSION)
     y0, y1 = pct(trend["final_yield"].iloc[0], 0), pct(trend["final_yield"].iloc[-1], 0)
     d0, d1 = trend["dppm"].iloc[0], trend["dppm"].iloc[-1]
     drop = (1 - d1 / d0) * 100

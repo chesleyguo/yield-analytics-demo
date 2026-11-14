@@ -314,6 +314,12 @@ def doe_results(rng: np.random.Generator) -> pd.DataFrame:
     return df
 
 
+def generator_hash() -> str:
+    """Fingerprint of this file; the app regenerates data when it no longer matches."""
+    import hashlib
+    return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
+
+
 def main(out_dir: str = "data") -> None:
     rng = np.random.default_rng(SEED)
     out = Path(out_dir)
@@ -331,6 +337,7 @@ def main(out_dir: str = "data") -> None:
     doe_results(rng).to_csv(out / "doe_results.csv", index=False)
 
     wk = units.groupby("week")["final_result"].apply(lambda s: (s == "PASS").mean())
+    (out / "_generator_hash.txt").write_text(generator_hash())
     print(f"Units: {len(units):,}   station records: {len(sr):,}")
     print("Final yield by week:", " ".join(f"W{w}:{y:.0%}" for w, y in wk.items()))
     print(f"Wrote CSVs to {out.resolve()}")
