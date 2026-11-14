@@ -76,6 +76,14 @@ FIX_EVENTS = [
          affected_station="Cosmetic Inspection"),
 ]
 
+# Unit-to-unit "marginality": some units are simply more fragile (marginal solder joints,
+# tolerance stack-up) and are more likely to fail or need a retest at *any* station.
+# Gamma(shape=K, mean=1). Smaller K = defects cluster more on the same units, which is
+# what real lines see, and is why unit-level FPY >= RTY (product of station FPYs).
+MARGINALITY_SHAPE = 0.9
+# Extra keyboard-station defect probability for the bad lot KB-B-3104.
+BAD_LOT_EXTRA = 0.12
+
 PHASES = {1: "EVT", 2: "EVT", 3: "EVT", 4: "DVT", 5: "DVT", 6: "DVT",
           7: "PVT", 8: "PVT", 9: "PVT", 10: "Ramp", 11: "Ramp", 12: "Ramp"}
 
@@ -154,6 +162,7 @@ def process_params(u: pd.DataFrame, rng: np.random.Generator) -> None:
     # Screw torque: stable, slightly noisy early (driver calibration)
     torque_sd = np.where(wf < 4.0, 0.075, 0.05)
     u["screw_torque_kgfcm"] = np.round(rng.normal(1.80, torque_sd), 3)
+    u["_marginality"] = rng.gamma(MARGINALITY_SHAPE, 1.0 / MARGINALITY_SHAPE, n)
 
 
 def failure_probs(u: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
@@ -166,31 +175,34 @@ def failure_probs(u: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
     ctime = u["cure_time_min"].to_numpy()
     torque = u["screw_torque_kgfcm"].to_numpy()
     lot = u["kb_lot"].to_numpy()
+    m = u["_marginality"].to_numpy()
 
     p = np.zeros((n, 6))
     # 0 SMT / Board test - immature stencil + reflow profile early
-    p[:, 0] = learning(wf, 0.200, 0.008)
+    p[:, 0] = learning(wf, 0.400, 0.006)
     # 1 Display attach - background + cure-temp/cure-time physics
     over = sigmoid((temp - 85.5) / 1.1)  # sharp rise above ~85-86 °C
     short = sigmoid((22.0 - ctime) / 0.8)
-    p[:, 1] = learning(wf, 0.100, 0.008) + 0.42 * over + 0.06 * short
+    p[:, 1] = learning(wf, 0.130, 0.006) + 0.60 * over + 0.06 * short
     # 2 Enclosure - torque out of spec strips screws
     oos = (torque < SPECS["screw_torque_kgfcm"]["lsl"]) | (torque > SPECS["screw_torque_kgfcm"]["usl"])
-    p[:, 2] = learning(wf, 0.120, 0.008) + 0.25 * oos
+    p[:, 2] = learning(wf, 0.210, 0.006) + 0.25 * oos
     # 3 Keyboard / trackpad - bad lot
-    p[:, 3] = learning(wf, 0.090, 0.008) + np.where(lot == "KB-B-3104", 0.20, 0.0)
+    p[:, 3] = learning(wf, 0.080, 0.006) + np.where(lot == "KB-B-3104", BAD_LOT_EXTRA, 0.0)
     # 4 Functional test
-    p[:, 4] = learning(wf, 0.230, 0.012)
+    p[:, 4] = learning(wf, 0.440, 0.005)
     # 5 Cosmetic - night shift handling gap until training in week 9
     night_gap = np.where((shift == "Night") & (wf < 9.0), 0.13, 0.0)
-    night_gap = np.where((shift == "Night") & (wf >= 9.0), 0.008, night_gap)
-    p[:, 5] = learning(wf, 0.110, 0.009) + night_gap
-    p = np.clip(p, 0, 0.95)
+    night_gap = np.where((shift == "Night") & (wf >= 9.0), 0.004, night_gap)
+    p[:, 5] = learning(wf, 0.160, 0.006) + night_gap
+    p = np.clip(p * m[:, None], 0, 0.95)
 
-    # No-fault-found (test flakiness -> retest passes). Higher at test stations.
+    # No-fault-found (test flakiness -> retest passes). Higher at test stations; marginal
+    # units are also the ones that read borderline on test.
     nff = np.zeros((n, 6))
     base_nff = learning(wf, 0.05, 0.012)
     nff[:, :] = base_nff[:, None] * np.array([1.6, 0.6, 0.4, 0.8, 1.8, 1.0])[None, :]
+    nff = np.clip(nff * m[:, None], 0, 0.95)
     return p, nff
 
 
@@ -269,7 +281,7 @@ def simulate(u: pd.DataFrame, rng: np.random.Generator) -> pd.DataFrame:
 def unit_summary(u: pd.DataFrame, sr: pd.DataFrame) -> pd.DataFrame:
     g = sr.groupby("serial")
     last = sr.loc[g["station_seq"].idxmax()].set_index("serial")
-    out = u.drop(columns=["day_idx", "week_float"]).set_index("serial")
+    out = u.drop(columns=["day_idx", "week_float", "_marginality"]).set_index("serial")
     out["stations_completed"] = last["station_seq"] - (last["result"] == "FAIL").astype(int)
     out["final_result"] = np.where((last["station_seq"] == 6) & (last["result"] == "PASS"), "PASS", "FAIL")
     out["fail_station"] = np.where(out["final_result"] == "FAIL", last["station"], "")

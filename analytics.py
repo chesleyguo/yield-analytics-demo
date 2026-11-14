@@ -47,21 +47,69 @@ def load_data(data_dir: Path = DATA_DIR) -> dict[str, pd.DataFrame]:
 
 
 # --------------------------------------------------------------------------- KPIs
+# KPI definitions (shown under each KPI card; kept here so code and UI agree)
+KPI_DEFS = {
+    "final_yield": ("Units passing all 6 stations (retests allowed) ÷ units started",
+                    "通过全部 6 个工站（允许复测）的数量 ÷ 投入数量"),
+    "fpy": ("Units passing all 6 stations on the first attempt, no retest ÷ units started",
+            "6 个工站全部一次通过、无复测的数量 ÷ 投入数量"),
+    "rty": ("Product of the 6 station first-pass yields (≤ FPY when defects cluster on the same units)",
+            "6 个工站直通率的乘积（缺陷集中在同一批产品上时 ≤ FPY）"),
+    "dppm": ("Failed first-pass station tests ÷ all station tests × 1,000,000",
+             "首次测试失败的工站测试数 ÷ 全部工站测试数 × 1,000,000"),
+    "retest_rate": ("Station tests that failed first, then passed on retest ÷ all station tests",
+                    "首次失败、复测后通过的工站测试数 ÷ 全部工站测试数"),
+    "units": ("Units started in the week", "本周投入数量"),
+}
+
+
 def kpis(units: pd.DataFrame, sr: pd.DataFrame) -> dict[str, float]:
-    """Yield KPIs for whatever slice of data is passed in."""
+    """Yield KPIs for whatever slice of data is passed in (see KPI_DEFS).
+
+    Identities that hold by construction (checked in `kpi_consistency`):
+      DPPM / 1e6 = 1 − pooled station first-pass yield = retest rate + confirmed-fail rate
+      RTY        = Π station first-pass yields  (same station FPYs as the Drill-down page)
+    """
     n = len(units)
     if n == 0:
-        return dict(final_yield=np.nan, fpy=np.nan, rty=np.nan, dppm=np.nan, retest_rate=np.nan, units=0)
+        return dict(final_yield=np.nan, fpy=np.nan, rty=np.nan, dppm=np.nan, retest_rate=np.nan,
+                    confirmed_fail_rate=np.nan, units=0)
     station_fpy = sr.groupby("station")["first_pass"].mean()
     rty = float(station_fpy.prod()) if len(station_fpy) else np.nan
+    fp_fail = ~sr["first_pass"]
+    passed = sr["result"] == "PASS"
     return dict(
         final_yield=(units["final_result"] == "PASS").mean(),
         fpy=units["first_pass_all"].mean(),
         rty=rty,
-        dppm=(sr["result"] == "FAIL").mean() * 1e6,
-        retest_rate=(sr["retest_count"] > 0).mean(),
+        dppm=fp_fail.mean() * 1e6,
+        retest_rate=(fp_fail & passed).mean(),
+        confirmed_fail_rate=(~passed).mean(),
         units=n,
     )
+
+
+def kpi_consistency(units: pd.DataFrame, sr: pd.DataFrame, tol: float = 1e-9) -> list[str]:
+    """Return a list of violated KPI relationships for every week (empty list = consistent)."""
+    problems = []
+    for w in sorted(units["week"].unique()):
+        u, s = units[units["week"] == w], sr[sr["week"] == w]
+        k = kpis(u, s)
+        st_fpy = s.groupby("station")["first_pass"].mean()
+        pooled = (s.groupby("station").size() * st_fpy).sum() / len(s)
+        checks = {
+            "RTY = product of station FPYs": abs(k["rty"] - st_fpy.prod()) < tol,
+            "RTY <= FPY (defects cluster on same units)": k["rty"] <= k["fpy"] + tol,
+            "FPY <= final yield": k["fpy"] <= k["final_yield"] + tol,
+            "RTY <= worst station FPY": k["rty"] <= st_fpy.min() + tol,
+            "DPPM = (1 - pooled station FPY) x 1e6": abs(k["dppm"] - (1 - pooled) * 1e6) < 1e-3,
+            "DPPM = (retest rate + confirmed-fail rate) x 1e6":
+                abs(k["dppm"] - (k["retest_rate"] + k["confirmed_fail_rate"]) * 1e6) < 1e-3,
+            "1 - RTY <= sum of station fail rates": 1 - k["rty"] <= (1 - st_fpy).sum() + tol,
+            "retest rate <= DPPM / 1e6": k["retest_rate"] <= k["dppm"] / 1e6 + tol,
+        }
+        problems += [f"Week {w}: {name}" for name, ok in checks.items() if not ok]
+    return problems
 
 
 def weekly_trend(units: pd.DataFrame, sr: pd.DataFrame) -> pd.DataFrame:
@@ -169,66 +217,106 @@ def cpk(values: np.ndarray, lsl: float, usl: float) -> tuple[float, float]:
 
 
 # --------------------------------------------------------------------------- anomaly detection
-def detect_anomalies(units: pd.DataFrame, z_thresh: float = 3.0, min_units: int = 15) -> pd.DataFrame:
-    """Flag line-days and keyboard lots whose yield falls below binomial p-chart limits.
+def _z_two_prop(pass1: float, n1: int, pass0: float, n0: int) -> tuple[float, float, float]:
+    """Two-proportion z-test (pooled SE) of group pass rate vs its reference group.
 
-    Baseline for each line-day = pooled yield of the *other* two lines that same week
-    (so slow improvement over the ramp isn't flagged). Lots are compared with other lots
-    in the same weeks.
+    Uses the uncertainty of *both* groups, so a small reference group can't make a
+    routine difference look like a many-sigma event."""
+    y, p0 = pass1 / n1, pass0 / n0
+    pp = (pass1 + pass0) / (n1 + n0)
+    se = np.sqrt(pp * (1 - pp) * (1 / n1 + 1 / n0))
+    return y, p0, ((y - p0) / se if se > 0 else 0.0)
+
+
+# station -> (action EN, action ZH, owner EN, owner ZH, timeframe EN, timeframe ZH); {w}/{wz} = where
+ACTIONS = {
+    "Display Attach": ("Audit {w} adhesive cure oven temperature control", "核查{wz}胶水固化烤炉的温度控制",
+                       "Process Engineer", "工艺工程师", "24h", "24 小时"),
+    "Keyboard / Trackpad": ("Check keyboard lot mix on {w}; hold suspect lots", "核对{wz}使用的键盘批次；扣留可疑批次",
+                            "SQE", "SQE", "24h", "24 小时"),
+    "Cosmetic Inspection": ("Retrain {w} operators on cosmetic handling & inspection standard",
+                            "对{wz}操作员进行外观搬运与检验标准再培训", "Line Supervisor", "产线主管", "1 week", "1 周"),
+    "SMT / Board Test": ("Review SMT reflow profile and stencil on {w}", "检查{wz}的 SMT 回流曲线和钢网",
+                         "Process Engineer", "工艺工程师", "48h", "48 小时"),
+    "Enclosure Assembly": ("Calibrate screwdriver torque on {w}", "校准{wz}的电批扭矩",
+                           "Equipment Engineer", "设备工程师", "48h", "48 小时"),
+    "Functional Test": ("Check test fixtures and station calibration on {w}", "检查{wz}的测试治具与工站校准",
+                        "Test Engineer", "测试工程师", "48h", "48 小时"),
+}
+LOT_ACTION = ("Quarantine lot {lot} and request supplier 8D", "隔离批次 {lot}，并要求供应商提交 8D",
+              "SQE", "SQE", "24h", "24 小时")
+
+
+def _driver_station(group: pd.DataFrame, ref: pd.DataFrame) -> str:
+    """Station whose failure rate is most elevated in `group` vs `ref`."""
+    g = group["fail_station"].value_counts() / len(group)
+    r = ref["fail_station"].value_counts() / max(len(ref), 1)
+    excess = {st: g.get(st, 0) - r.get(st, 0) for st in STATIONS}
+    return max(excess, key=excess.get)
+
+
+def _action(kind: str, station: str, where_en: str, where_zh: str, lot: str = "") -> dict:
+    if kind == "Supplier lot":
+        a = LOT_ACTION
+        return dict(driver_station=station, action_en=a[0].format(lot=lot), action_zh=a[1].format(lot=lot),
+                    owner_en=a[2], owner_zh=a[3], timeframe_en=a[4], timeframe_zh=a[5])
+    a = ACTIONS[station]
+    return dict(driver_station=station, action_en=a[0].format(w=where_en), action_zh=a[1].format(wz=where_zh),
+                owner_en=a[2], owner_zh=a[3], timeframe_en=a[4], timeframe_zh=a[5])
+
+
+def detect_anomalies(units: pd.DataFrame, z_thresh: float = 3.0, min_units: int = 15) -> pd.DataFrame:
+    """Flag line-days, line-weeks, shift-weeks and keyboard lots whose yield is significantly
+    below their peers built in the same week (two-proportion z-test).
+
+    Comparing against same-week peers means the normal ramp-up improvement isn't flagged.
+    Each anomaly gets a rule-based suggested action, owner role and timeframe, chosen from
+    the station whose failures are most elevated in that group.
     """
     out = []
-    ld = units.groupby(["date", "week", "line"]).agg(
-        units=("serial", "size"), passed=("final_result", lambda s: (s == "PASS").sum())).reset_index()
-    wk_line = ld.groupby(["week", "line"])[["units", "passed"]].sum()
-    wk_all = ld.groupby("week")[["units", "passed"]].sum()
-    for _, r in ld.iterrows():
-        if r["units"] < min_units:
+    passed = units["final_result"] == "PASS"
+    u = units.assign(_pass=passed)
+
+    def add(kind, entity, week, grp, ref, line="", date=pd.NaT, where=("", ""), lot=""):
+        y, p0, z = _z_two_prop(grp["_pass"].sum(), len(grp), ref["_pass"].sum(), len(ref))
+        if z < -z_thresh:
+            st = "Keyboard / Trackpad" if kind == "Supplier lot" else _driver_station(grp, ref)
+            out.append(dict(kind=kind, entity=entity, week=int(week), units=len(grp), yield_=y, expected=p0, z=z,
+                            line=line, date=date, **_action(kind, st, where[0], where[1], lot)))
+
+    def line_where(line):
+        return line, f"{line.split()[-1]}号线"
+
+    for (date, week, line), g in u.groupby(["date", "week", "line"]):
+        if len(g) < min_units:
             continue
-        others = wk_all.loc[r["week"]] - wk_line.loc[(r["week"], r["line"])]
-        p0 = others["passed"] / others["units"]
-        y = r["passed"] / r["units"]
-        se = np.sqrt(p0 * (1 - p0) / r["units"])
-        z = (y - p0) / se if se > 0 else 0
-        if z < -z_thresh:
-            out.append(dict(kind="Line-day", entity=f"{r['line']} · {r['date']:%a %b %d}",
-                            week=int(r["week"]), units=int(r["units"]), yield_=y, expected=p0, z=z,
-                            line=r["line"], date=r["date"]))
-    # line-week (others = other two lines same week)
-    for (w, line), r in wk_line.iterrows():
-        o = wk_all.loc[w] - r
-        p0 = o["passed"] / o["units"]
-        y = r["passed"] / r["units"]
-        z = (y - p0) / np.sqrt(p0 * (1 - p0) / r["units"])
-        if z < -z_thresh:
-            out.append(dict(kind="Line-week", entity=f"{line} · Week {w}", week=int(w), units=int(r["units"]),
-                            yield_=y, expected=p0, z=z, line=line, date=pd.NaT))
-    # shift-week
-    sw = units.groupby(["week", "shift"]).agg(units=("serial", "size"),
-                                              passed=("final_result", lambda s: (s == "PASS").sum())).reset_index()
-    for w, g in sw.groupby("week"):
-        for _, r in g.iterrows():
-            o = g[g["shift"] != r["shift"]]
-            p0 = o["passed"].sum() / o["units"].sum()
-            y = r["passed"] / r["units"]
-            z = (y - p0) / np.sqrt(p0 * (1 - p0) / r["units"])
-            if z < -z_thresh:
-                out.append(dict(kind="Shift-week", entity=f"{r['shift']} shift · Week {w}", week=int(w),
-                                units=int(r["units"]), yield_=y, expected=p0, z=z, line="", date=pd.NaT))
-    # keyboard lots (keyboard-station FPY vs other lots in the same weeks)
-    for lot, g in units.groupby("kb_lot"):
+        ref = u[(u["week"] == week) & (u["line"] != line)]
+        add("Line-day", f"{line} · {date:%a %b %d}", week, g, ref, line, date, line_where(line))
+    for (week, line), g in u.groupby(["week", "line"]):
+        ref = u[(u["week"] == week) & (u["line"] != line)]
+        add("Line-week", f"{line} · Week {week}", week, g, ref, line, pd.NaT, line_where(line))
+    for (week, sh), g in u.groupby(["week", "shift"]):
+        ref = u[(u["week"] == week) & (u["shift"] != sh)]
+        add("Shift-week", f"{sh} shift · Week {week}", week, g, ref,
+            where=(f"{sh.lower()}-shift", "夜班" if sh == "Night" else "白班"))
+    # keyboard lots: keyboard-station pass rate vs other lots built in the same weeks
+    for lot, g in u.groupby("kb_lot"):
+        if len(g) < min_units:
+            continue
         weeks = g["week"].unique()
-        ref = units[units["week"].isin(weeks) & (units["kb_lot"] != lot)]
-        def kb_ok(df):
-            return (df["fail_station"] != "Keyboard / Trackpad")
-        y, p0 = kb_ok(g).mean(), kb_ok(ref).mean()
-        z = (y - p0) / np.sqrt(p0 * (1 - p0) / len(g))
-        if z < -z_thresh and len(g) >= min_units:
-            out.append(dict(kind="Supplier lot", entity=f"{lot} (keyboard station)",
-                            week=int(weeks.min()), units=len(g), yield_=y, expected=p0, z=z, line="", date=pd.NaT))
+        ref = u[u["week"].isin(weeks) & (u["kb_lot"] != lot)]
+        gk = g.assign(_pass=g["fail_station"] != "Keyboard / Trackpad")
+        rk = ref.assign(_pass=ref["fail_station"] != "Keyboard / Trackpad")
+        add("Supplier lot", f"{lot} (keyboard station)", weeks.min(), gk, rk, lot=lot)
     df = pd.DataFrame(out)
     if df.empty:
         return df
     return df.sort_values("z").reset_index(drop=True)
+
+
+def format_sigma(z: float, cap: float = 10.0) -> str:
+    """Display helper: |z| beyond `cap` is shown as '>10σ' (exact value kept in the data)."""
+    return f">{cap:g}σ" if abs(z) > cap else f"{abs(z):.1f}σ"
 
 
 # --------------------------------------------------------------------------- root-cause hints
@@ -302,6 +390,24 @@ class Hint:
                 f"this condition accounts for {self.share_of_failures:.0%} of those failures.")
 
 
+def _cmh_pvalue(y: np.ndarray, mask: np.ndarray, strata: np.ndarray) -> float:
+    """Cochran-Mantel-Haenszel test of y vs mask, stratified (here: by build week)."""
+    num, var = 0.0, 0.0
+    for s in np.unique(strata):
+        k = strata == s
+        n = k.sum()
+        n1, c1 = mask[k].sum(), y[k].sum()
+        if n < 2 or n1 in (0, n) or c1 in (0, n):
+            continue
+        a = y[k & mask].sum()
+        num += a - n1 * c1 / n
+        var += n1 * (n - n1) * c1 * (n - c1) / (n ** 2 * (n - 1))
+    if var <= 0:
+        return 1.0
+    chi2 = (abs(num) - 0.5) ** 2 / var
+    return float(stats.chi2.sf(chi2, 1))
+
+
 def _mh_risk_ratio(y: np.ndarray, mask: np.ndarray, strata: np.ndarray) -> float:
     """Mantel-Haenszel risk ratio of y between mask / ~mask, stratified (here: by week)."""
     num = den = 0.0
@@ -365,7 +471,7 @@ def root_cause_hints(sr: pd.DataFrame, top_n_codes: int = 8, min_support: int = 
         crude = (a / n_in) / (c / (~mask).sum()) if c > 0 else np.inf
         if crude < 1.5:
             continue  # adjusted-only effect (e.g. competing defect codes) - not actionable
-        _, pval, _, _ = stats.chi2_contingency([[a, n_in - a], [c, (~mask).sum() - c]])
+        pval = _cmh_pvalue(y, mask, d["week"].to_numpy())  # week-stratified, like the risk ratio
         # Where do the at-risk units concentrate? (line / shift / supplier)
         ctx_parts, ctx_zh = [], []
         sub = d[mask]

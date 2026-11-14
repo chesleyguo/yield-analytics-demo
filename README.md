@@ -47,7 +47,7 @@ Every chart has a one-line takeaway. Most takeaways are computed from the data, 
 ## Synthetic data (`generate_data.py`, seed = 42)
 
 * 12 weeks × 6 days, 3 lines, 2 shifts, 6 stations in order: SMT/Board Test → Display Attach → Enclosure Assembly → Keyboard/Trackpad → Functional Test → Cosmetic Inspection
-* About 17k units and 93k station records. Each unit has a serial, timestamp, line, shift, station, PASS/FAIL, retest count, defect code, keyboard and display supplier lots, cure temp, cure time and screw torque.
+* About 17k units and 90k station records. Each unit has a serial, timestamp, line, shift, station, PASS/FAIL, retest count, defect code, keyboard and display supplier lots, cure temp, cure time and screw torque.
 * The general learning curve (an immature process early on) and no-fault-found retests are both modelled.
 
 | # | Embedded root cause | Active | Fix (in `data/fix_events.csv`) |
@@ -62,16 +62,21 @@ Output files: `data/station_results.csv`, `data/units.csv`, `data/fix_events.csv
 
 ## Methods (in `analytics.py`)
 
-* **KPIs**
+* **KPIs** (each card shows its definition under the number):
   * Final yield = units that pass all 6 stations (retests allowed) ÷ units started.
-  * FPY = units that pass every station on the first attempt.
-  * RTY = Π station first-pass yields.
-  * DPPM = hard station failures per million station tests.
-* **Anomaly detection**: a binomial p-chart. Each line-day, line-week, shift-week and keyboard lot is compared with its *peers built in the same week*. The normal ramp improvement therefore isn't flagged. Severity is set by the σ distance.
+  * FPY = units that pass every station on the first attempt, with no retest ÷ units started.
+  * RTY = Π station first-pass yields, using the same station FPYs as the Drill-down page. RTY ≤ FPY because defects cluster on the same "marginal" units. The generator models this with a per-unit marginality factor.
+  * DPPM = failed first-pass station tests ÷ all station tests × 1,000,000.
+  * Retest rate = station tests that failed first, then passed on retest ÷ all station tests.
+  * `kpi_consistency()` checks every week that RTY = Π station FPY ≤ FPY ≤ final yield, and that DPPM/10⁶ = 1 − pooled station FPY = retest rate + confirmed-fail rate. The smoke test fails if any of these breaks.
+* **Anomaly detection**: a two-proportion z-test. Each line-day, line-week, shift-week and keyboard lot is compared with its *peers built in the same week*, so the normal ramp improvement isn't flagged.
+  * Severity is set by the σ distance. Values beyond 10σ are displayed as ">10σ".
+  * The UI shows the top 3 cards; the full table is in a collapsed expander.
+  * Each anomaly gets a rule-based suggested action, owner role and timeframe, picked from the station whose failures are most elevated in that group.
 * **Root-cause hints**: for each top defect code, a depth-1 (or depth-2) decision tree searches line, shift, supplier lots and process parameters for the best split. Build week is also a candidate feature, so a pure learning-curve effect "wins" and is discarded. Each hint is kept only if:
   * the week-adjusted (Mantel-Haenszel) risk ratio is at least 2×,
   * the crude risk ratio is at least 1.5×,
-  * and p < 1e-6.
+  * and the week-stratified Cochran-Mantel-Haenszel p < 1e-6.
 * **Factor association**: week-stratified χ² of final failure against each factor.
 * **SPC**: subgroups of n = 5 sampled per line, shift and day. Limits use A2·R̄. The chart applies Western Electric rules 1–4, and Cpk uses the spec limits.
 * **DOE**: a 2² full factorial with 3 replicates and 3 center points. It reports main effects, the interaction, a noise band and the best setting.

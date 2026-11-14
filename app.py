@@ -75,6 +75,10 @@ st.markdown("""
   .kpi .lbl {font-size:0.92rem; color:#52514e; margin-bottom:2px;}
   .kpi .val {font-size:2.0rem; font-weight:650; color:#0b0b0b; line-height:1.15;}
   .kpi .dlt {font-size:0.95rem; margin-top:2px;}
+  .kpi {height:100%; cursor:help;}
+  .kpi .def {font-size:0.78rem; color:#6b6a65; margin-top:8px; line-height:1.3; border-top:1px solid #eeece6; padding-top:6px;}
+  .act {font-size:0.98rem; margin-top:6px; color:#1b1b1b;}
+  .act .tag {display:inline-block; background:#f2f1ee; border-radius:6px; padding:1px 8px; margin-right:6px; font-size:0.88rem;}
   .good {color:#0e7a52;} .bad {color:#c22f2e;} .flat {color:#6b6a65;}
   .hint {background:#ffffff; border:1px solid #e4e2dc; border-left:5px solid #eb6834; border-radius:8px;
          padding:12px 16px; margin-bottom:10px; font-size:1.08rem;}
@@ -206,7 +210,7 @@ def page_overview():
     specs = [(T("Final yield", "最终良率"), "final_yield", "pct", True),
              (T("First-pass yield (FPY)", "直通率 (FPY)"), "fpy", "pct", True),
              (T("Rolled throughput yield (RTY)", "滚动直通率 (RTY)"), "rty", "pct", True),
-             (T("DPPM (station fails)", "DPPM（工站失效）"), "dppm", "int", False),
+             (T("DPPM (station first-pass fails)", "DPPM（工站首次失败）"), "dppm", "int", False),
              (T("Retest rate", "复测率"), "retest_rate", "pct", False), (T("Units built", "生产数量"), "units", "int", None)]
     cols = st.columns(6)
     for col, (lbl, key, fmt, higher_good) in zip(cols, specs):
@@ -221,9 +225,12 @@ def page_overview():
             else:
                 dl = T(f"{'▲' if dv >= 0 else '▼'} {abs(dv) / max(prev[key], 1) * 100:.0f}% WoW",
                        f"环比 {'▲' if dv >= 0 else '▼'} {abs(dv) / max(prev[key], 1) * 100:.0f}%")
-            cls = "flat" if higher_good is None or abs(dv) < 1e-9 else ("good" if (dv > 0) == higher_good else "bad")
-        col.markdown(f'<div class="kpi"><div class="lbl">{lbl}</div><div class="val">{val}</div>'
-                     f'<div class="dlt {cls}">{dl}</div></div>', unsafe_allow_html=True)
+            tiny = abs(dv) < (0.0005 if fmt == "pct" else 0.0005 * max(prev[key], 1))  # rounds to 0.0
+            cls = "flat" if higher_good is None or tiny else ("good" if (dv > 0) == higher_good else "bad")
+        d_en, d_zh = A.KPI_DEFS[key]
+        dfn = T(d_en, d_zh)
+        col.markdown(f'<div class="kpi" title="{dfn}"><div class="lbl">{lbl}</div><div class="val">{val}</div>'
+                     f'<div class="dlt {cls}">{dl}</div><div class="def">ⓘ {dfn}</div></div>', unsafe_allow_html=True)
     st.write("")
 
     st.subheader(T("Weekly yield trend with corrective actions", "每周良率趋势与纠正措施"))
@@ -587,10 +594,14 @@ def page_ai():
             an["Severity"] = np.where(an["z"] < -5, T("🔴 Critical", "🔴 严重"),
                                       np.where(an["z"] < -3.5, T("🟠 High", "🟠 高"), T("🟡 Watch", "🟡 关注")))
             kind_zh = {"Supplier lot": "供应商批次", "Shift-week": "班次-周", "Line-week": "产线-周", "Line-day": "产线-日"}
+            an["sigma"] = an["z"].map(A.format_sigma)
+            an["action"] = an["action_zh"] if ZH else an["action_en"]
+            an["owner"] = an["owner_zh"] if ZH else an["owner_en"]
+            an["timeframe"] = an["timeframe_zh"] if ZH else an["timeframe_en"]
             an["group"] = np.where(an["kind"] == "Supplier lot", an["entity"],
                                    np.where(an["kind"] == "Shift-week", an["entity"].str.split(" ·").str[0], an["line"]))
-            groups = an.groupby("group", sort=False)
-            for gname, g in list(groups)[:4]:
+            # Top 3 cards: the strongest anomaly in each of the 3 most-affected places
+            for gname, g in list(an.groupby("group", sort=False))[:3]:
                 r = g.iloc[0]
                 what = (T("keyboard-station pass rate", "键盘工站通过率") if r["kind"] == "Supplier lot"
                         else T("final yield", "最终良率"))
@@ -598,33 +609,49 @@ def page_ai():
                 if ZH:
                     more = f" · 第 {', '.join(map(str, ow))} 周也被标记" if ow else ""
                     body = (f'<b>{tr_text(r["entity"])}</b> — {what} <b>{pct(r["yield_"])}</b>，预期 {pct(r["expected"])}'
-                            f'（低于正常波动 {abs(r["z"]):.1f}σ；{r["units"]:,} 台）{more}')
+                            f'（低于正常波动 {r["sigma"]}；{r["units"]:,} 台）{more}')
+                    act = (f'<span class="tag">💡 建议措施</span>{r["action"]}<br>'
+                           f'<span class="tag">👤 负责人</span>{r["owner"]} &nbsp; <span class="tag">⏱ 时限</span>{r["timeframe"]}')
                 else:
                     more = f" · also flagged in week{'s' if len(ow) > 1 else ''} {', '.join(map(str, ow))}" if ow else ""
                     body = (f'<b>{r["entity"]}</b> — {what} <b>{pct(r["yield_"])}</b> vs expected {pct(r["expected"])} '
-                            f'({abs(r["z"]):.1f}σ below normal; {r["units"]:,} units){more}')
-                st.markdown(f'<div class="hint">{r["Severity"]} &nbsp;{body}</div>', unsafe_allow_html=True)
-            tbl = an.copy()
-            if ZH:
-                tbl["kind"] = tbl["kind"].map(kind_zh)
-                tbl["entity"] = tbl["entity"].map(tr_text)
-            cols = {"Severity": T("Severity", "严重程度"), "kind": T("Type", "类型"), "entity": T("Where", "位置"),
-                    "week": T("Week", "周"), "units": T("Units", "数量"), "yield_": T("Observed", "实际"),
-                    "expected": T("Expected", "预期"), "z": T("σ from expected", "偏离 σ")}
-            tbl = tbl[list(cols)].rename(columns=cols)
-            st.dataframe(tbl, hide_index=True, width="stretch",
-                         column_config={cols["yield_"]: st.column_config.NumberColumn(format="percent"),
-                                        cols["expected"]: st.column_config.NumberColumn(format="percent"),
-                                        cols["z"]: st.column_config.NumberColumn(format="%.1f")})
-            st.caption(T("Method: binomial p-chart. Each line / shift / lot is compared against its peers built in the "
-                         "same week, so the normal ramp-up improvement isn't flagged as an anomaly.",
-                         "方法：二项分布 p 控制图。每条产线/班次/批次都与同一周生产的同类对比，"
-                         "因此正常的爬坡改善不会被误报为异常。"))
+                            f'({r["sigma"]} below normal; {r["units"]:,} units){more}')
+                    act = (f'<span class="tag">💡 Suggested action</span>{r["action"]}<br>'
+                           f'<span class="tag">👤 Owner</span>{r["owner"]} &nbsp; <span class="tag">⏱ Within</span>{r["timeframe"]}')
+                st.markdown(f'<div class="hint">{r["Severity"]} &nbsp;{body}<div class="act">{act}</div></div>',
+                            unsafe_allow_html=True)
             top3 = [tr_text(x) for x in list(dict.fromkeys(an["group"]))[:3]]
             takeaway(T(f"<b>{len(an)}</b> anomalies flagged automatically, and they cluster on just a few places — "
-                       f"<b>{', '.join(top3)}</b>. That's where the engineers should look first.",
+                       f"<b>{', '.join(top3)}</b>. Each comes with an owner and a deadline, so it turns into action.",
                        f"自动标记了 <b>{len(an)}</b> 个异常，且集中在少数几处 —— <b>{'、'.join(top3)}</b>。"
-                       "工程师应该先从这里查起。"))
+                       "每个异常都有负责人和时限，可以直接转化为行动。"))
+
+            with st.expander(T(f"Show all anomalies ({len(an)})", f"显示全部异常（{len(an)} 个）"), expanded=False):
+                tbl = an.copy()
+                if ZH:
+                    tbl["kind"] = tbl["kind"].map(kind_zh)
+                    tbl["entity"] = tbl["entity"].map(tr_text)
+                tbl["z_exact"] = tbl["z"].abs()
+                cols = {"Severity": T("Severity", "严重程度"), "kind": T("Type", "类型"), "entity": T("Where", "位置"),
+                        "week": T("Week", "周"), "units": T("Units", "数量"), "yield_": T("Observed", "实际"),
+                        "expected": T("Expected", "预期"), "sigma": T("σ below", "低于 σ"),
+                        "action": T("Suggested action", "建议措施"), "owner": T("Owner", "负责人"),
+                        "timeframe": T("Within", "时限"), "z_exact": T("Exact σ", "精确 σ")}
+                tbl = tbl[list(cols)].rename(columns=cols)
+                st.dataframe(tbl, hide_index=True, width="stretch",
+                             column_config={
+                                 cols["yield_"]: st.column_config.NumberColumn(format="percent"),
+                                 cols["expected"]: st.column_config.NumberColumn(format="percent"),
+                                 cols["sigma"]: st.column_config.TextColumn(
+                                     help=T("Values beyond 10σ are shown as >10σ; see 'Exact σ' for the computed value.",
+                                            "超过 10σ 的值显示为 >10σ；计算出的精确值见“精确 σ”列。")),
+                                 cols["z_exact"]: st.column_config.NumberColumn(format="%.1f"),
+                                 cols["action"]: st.column_config.TextColumn(width="large")})
+                st.caption(T("Method: two-proportion z-test. Each line / shift / lot is compared against its peers built in "
+                             "the same week, so the normal ramp-up improvement isn't flagged. The suggested action is chosen "
+                             "from the station whose failures are most elevated in that group.",
+                             "方法：双比例 z 检验。每条产线/班次/批次都与同一周生产的同类对比，因此正常的爬坡改善不会被误报。"
+                             "建议措施根据该组中失效率升高最多的工站来确定。"))
 
     with tabs[1]:
         c1, _ = st.columns([1.2, 2])
@@ -817,7 +844,7 @@ def page_program():
         (T("Yield ramp speed", "良率爬坡速度"), T("Weeks to reach 90% final yield", "达到 90% 最终良率所需周数"),
          T("≥ 90% by start of mass-production ramp", "量产爬坡开始前 ≥ 90%"),
          T(f"{y0} → {y1} in 12 weeks", f"12 周内 {y0} → {y1}")),
-        (T("DPPM (station fails)", "DPPM（工站失效）"), f"{d0:,.0f} (W1)", T("−80% by Ramp", "量产爬坡前降低 80%"),
+        (T("DPPM (station first-pass fails)", "DPPM（工站首次失败）"), f"{d0:,.0f} (W1)", T("−80% by Ramp", "量产爬坡前降低 80%"),
          T(f"{d1:,.0f} (W12), {drop:.0f}% lower", f"{d1:,.0f}（W12），降低 {drop:.0f}%")),
         (T("Retest rate", "复测率"), pct(trend["retest_rate"].iloc[0]), "< 3%", pct(trend["retest_rate"].iloc[-1])),
         (T("Adoption", "使用率"), "—",
