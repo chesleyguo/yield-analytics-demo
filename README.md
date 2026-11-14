@@ -86,4 +86,5 @@ i18n.py             English / Chinese display translations
 generate_data.py    synthetic data generator (numpy/pandas, fixed seed)
 tests/smoke_test.py headless test of every page and root-cause detection
 DEMO_SCRIPT.md      2-minute and 30-second talk tracks
+DEMO_SCRIPT_zh.md   中文讲稿 (Chinese talk tracks + glossary)
 ```
