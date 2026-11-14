@@ -14,6 +14,8 @@ import pandas as pd
 from scipy import stats
 from sklearn.tree import DecisionTreeClassifier
 
+import i18n
+
 DATA_DIR = Path(__file__).parent / "data"
 
 STATIONS = [
@@ -280,6 +282,17 @@ class Hint:
     share_of_failures: float
     p_value: float
     context: str = ""
+    context_zh: str = ""
+
+    def text(self, lang: str = "en") -> str:
+        return self.sentence_zh if lang == "zh" else self.sentence
+
+    @property
+    def sentence_zh(self) -> str:
+        ctx = f"{self.context_zh}" if self.context_zh else ""
+        return (f"**{i18n.station(self.station, 'zh')}** 失效（{self.defect_code}）在 **{i18n.text(self.condition, 'zh')}** "
+                f"条件下**高出 {self.risk_ratio:.1f} 倍**{ctx} —— {self.rate_in:.1%} 对比 {self.rate_out:.1%}；"
+                f"该条件解释了此类失效的 {self.share_of_failures:.0%}。")
 
     @property
     def sentence(self) -> str:
@@ -354,8 +367,10 @@ def root_cause_hints(sr: pd.DataFrame, top_n_codes: int = 8, min_support: int = 
             continue  # adjusted-only effect (e.g. competing defect codes) - not actionable
         _, pval, _, _ = stats.chi2_contingency([[a, n_in - a], [c, (~mask).sum() - c]])
         # Where do the at-risk units concentrate? (line / shift / supplier)
-        ctx_parts = []
+        ctx_parts, ctx_zh = [], []
         sub = d[mask]
+        zh_fmt = {"line": lambda v: f"（集中在 {i18n.line(v, 'zh')}）", "shift": lambda v: f"（集中在{i18n.shift(v, 'zh')}）",
+                  "kb_supplier": lambda v: f"（来自 {v}）"}
         for col, fmt in (("line", "on {}"), ("shift", "on {} shift"), ("kb_supplier", "from {}")):
             if feat.startswith(col) or (col == "shift" and feat == "is_night"):
                 continue
@@ -364,12 +379,15 @@ def root_cause_hints(sr: pd.DataFrame, top_n_codes: int = 8, min_support: int = 
             top = share.index[0]
             if share.iloc[0] >= 0.7 and share.iloc[0] > base.get(top, 0) + 0.2:
                 ctx_parts.append(fmt.format(top))
+                ctx_zh.append(zh_fmt[col](top))
         wk = sub.loc[sub["defect_code"] == code, "week"]
-        ctx_parts.append(f"(failures concentrated in weeks {int(wk.quantile(.05))}–{int(wk.quantile(.95))})")
+        w_lo, w_hi = int(wk.quantile(.05)), int(wk.quantile(.95))
+        ctx_parts.append(f"(failures concentrated in weeks {w_lo}–{w_hi})")
+        ctx_zh.append(f"（失效集中在第 {w_lo}–{w_hi} 周）")
         if pval > 1e-6:
             continue  # many splits are searched - demand strong evidence
         hints.append(Hint(station, code, cond, rr, a / n_in, c / (~mask).sum(), n_in,
-                          a / y.sum(), pval, " ".join(ctx_parts)))
+                          a / y.sum(), pval, " ".join(ctx_parts), "".join(ctx_zh)))
     return sorted(hints, key=lambda h: -h.risk_ratio)
 
 
@@ -437,73 +455,109 @@ def doe_analysis(doe: pd.DataFrame) -> dict:
 
 
 # --------------------------------------------------------------------------- rule-based Q&A
-EXAMPLE_QUESTIONS = [
-    "Which line has the lowest yield?",
-    "What is the top defect?",
-    "Which supplier lot is worst?",
-    "Is night shift worse than day shift?",
-    "How has yield changed?",
-    "Which parameter is least capable?",
-    "What fixes were made?",
-]
+EXAMPLE_QUESTIONS = {
+    "en": [
+        "Which line has the lowest yield?",
+        "What is the top defect?",
+        "Which supplier lot is worst?",
+        "Is night shift worse than day shift?",
+        "How has yield changed?",
+        "Which parameter is least capable?",
+        "What fixes were made?",
+    ],
+    "zh": [
+        "哪条产线良率最低？",
+        "最主要的缺陷是什么？",
+        "哪个供应商批次最差？",
+        "夜班比白班差吗？",
+        "良率趋势如何？",
+        "哪个工艺参数能力最差？",
+        "做了哪些改进措施？",
+    ],
+}
 
 
-def answer_question(q: str, data: dict) -> str:
-    """Keyword/intent matcher over the data. No API key or network needed."""
+def _has(ql: str, *words) -> bool:
+    return any(w in ql for w in words)
+
+
+def answer_question(q: str, data: dict, lang: str = "en") -> str:
+    """Keyword/intent matcher over the data (English or Chinese). No API key or network needed."""
+    zh = lang == "zh"
     ql = q.lower()
     u, sr, fixes = data["units"], data["sr"], data["fixes"]
-    wk = re.search(r"week\s*(\d+)", ql)
+    wk = re.search(r"week\s*(\d+)|第\s*(\d+)\s*周|w(\d+)\b", ql)
     if wk:
-        w = int(wk.group(1))
+        w = int(next(g for g in wk.groups() if g))
         u, sr = u[u["week"] == w], sr[sr["week"] == w]
-        scope = f"In week {w}"
+        scope = f"第 {w} 周" if zh else f"In week {w}"
         if u.empty:
-            return f"There is no data for week {w} (data covers weeks 1–12)."
+            return f"没有第 {w} 周的数据（数据覆盖第 1–12 周）。" if zh else f"There is no data for week {w} (data covers weeks 1–12)."
     else:
-        scope = "Across all 12 weeks"
+        scope = "12 周整体来看" if zh else "Across all 12 weeks"
+    L = lambda en, cn: cn if zh else en
 
-    if any(k in ql for k in ["fix", "action", "change made", "what changed", "corrective"]):
+    if _has(ql, "fix", "action", "change made", "what changed", "corrective", "修复", "措施", "改进", "纠正"):
+        if zh:
+            lines = [f"- **第 {r.week} 周** – {i18n.FIX_TITLE_ZH.get(r.week, r.title)}（负责：{i18n.FIX_OWNER_ZH.get(r.week, r.owner)}）"
+                     for r in fixes.itertuples()]
+            return "已记录的纠正措施：\n" + "\n".join(lines)
         lines = [f"- **Week {r.week}** – {r.title} (owner: {r.owner})" for r in fixes.itertuples()]
         return "Corrective actions on record:\n" + "\n".join(lines)
-    if "line" in ql and any(k in ql for k in ["worst", "lowest", "bad", "which"]):
+    if (_has(ql, "line") and _has(ql, "worst", "lowest", "bad", "which")) or _has(ql, "产线", "哪条线", "线体"):
         t = yield_by(u, "line").sort_values("yield")
         w, b = t.iloc[0], t.iloc[-1]
-        return (f"{scope}, **{w['line']}** has the lowest final yield at **{w['yield']:.1%}** "
-                f"({(b['yield'] - w['yield']) * 100:.1f} pts below {b['line']}). "
-                "Check *AI Insights → Root-cause hints* for the driver.")
-    if any(k in ql for k in ["lot", "supplier"]):
+        gap = (b["yield"] - w["yield"]) * 100
+        return L(f"{scope}, **{w['line']}** has the lowest final yield at **{w['yield']:.1%}** "
+                 f"({gap:.1f} pts below {b['line']}). Check *AI Insights → Root-cause hints* for the driver.",
+                 f"{scope}，**{i18n.line(w['line'], 'zh')}** 的最终良率最低，为 **{w['yield']:.1%}**"
+                 f"（比 {i18n.line(b['line'], 'zh')} 低 {gap:.1f} 个百分点）。原因见 *AI 洞察 → 根因提示*。")
+    if _has(ql, "lot", "supplier", "批次", "供应商"):
         kb = u.groupby("kb_lot").agg(n=("serial", "size"),
                                      kb_fail=("fail_station", lambda s: (s == "Keyboard / Trackpad").mean()))
         kb = kb[kb["n"] >= 30].sort_values("kb_fail", ascending=False)
-        top = kb.index[0]
-        med = kb["kb_fail"].median()
-        return (f"{scope}, keyboard lot **{top}** is worst: **{kb.iloc[0]['kb_fail']:.1%}** of its units fail at "
-                f"Keyboard/Trackpad vs a median of {med:.1%} for other lots "
-                f"({kb.iloc[0]['kb_fail'] / max(med, 1e-9):.1f}×).")
-    if any(k in ql for k in ["shift", "night", "day"]):
+        if kb.empty:
+            return L("Not enough units per lot in this scope.", "该范围内各批次数量不足。")
+        top, med = kb.index[0], kb["kb_fail"].median()
+        r = kb.iloc[0]["kb_fail"] / max(med, 1e-9)
+        return L(f"{scope}, keyboard lot **{top}** is worst: **{kb.iloc[0]['kb_fail']:.1%}** of its units fail at "
+                 f"Keyboard/Trackpad vs a median of {med:.1%} for other lots ({r:.1f}×).",
+                 f"{scope}，键盘批次 **{top}** 最差：**{kb.iloc[0]['kb_fail']:.1%}** 的产品在键盘/触控板工站失效，"
+                 f"其他批次中位数为 {med:.1%}（{r:.1f} 倍）。")
+    if _has(ql, "shift", "night", "day", "班"):
         t = yield_by(u, "shift").set_index("shift")["yield"]
         cos = sr[sr["station"] == "Cosmetic Inspection"].groupby("shift")["result"].apply(lambda s: (s == "FAIL").mean())
-        return (f"{scope}, day shift yield is **{t.get('Day', np.nan):.1%}** vs night **{t.get('Night', np.nan):.1%}**. "
-                f"Cosmetic-inspection fail rate: day {cos.get('Day', np.nan):.1%}, night {cos.get('Night', np.nan):.1%}.")
-    if any(k in ql for k in ["defect", "pareto", "failure mode", "top fail", "most common"]):
+        return L(f"{scope}, day shift yield is **{t.get('Day', np.nan):.1%}** vs night **{t.get('Night', np.nan):.1%}**. "
+                 f"Cosmetic-inspection fail rate: day {cos.get('Day', np.nan):.1%}, night {cos.get('Night', np.nan):.1%}.",
+                 f"{scope}，白班良率 **{t.get('Day', np.nan):.1%}**，夜班 **{t.get('Night', np.nan):.1%}**。"
+                 f"外观检验失效率：白班 {cos.get('Day', np.nan):.1%}，夜班 {cos.get('Night', np.nan):.1%}。")
+    if _has(ql, "defect", "pareto", "failure mode", "top fail", "most common", "缺陷", "不良", "失效模式", "柏拉图"):
         p = pareto(sr)
         if p.empty:
-            return f"{scope}, no failures were recorded."
+            return L(f"{scope}, no failures were recorded.", f"{scope}没有记录到失效。")
         top3 = ", ".join(f"{r.defect_code} ({r.pct:.0%})" for r in p.head(3).itertuples())
-        return f"{scope}, the top defect is **{p.iloc[0]['defect_code']}** at {p.iloc[0]['station']}. Top 3: {top3}."
-    if any(k in ql for k in ["cpk", "capab", "parameter", "spc", "torque", "temp", "cure"]):
+        return L(f"{scope}, the top defect is **{p.iloc[0]['defect_code']}** at {p.iloc[0]['station']}. Top 3: {top3}.",
+                 f"{scope}，最主要的缺陷是 **{p.iloc[0]['defect_code']}**（{i18n.station(p.iloc[0]['station'], 'zh')}）。"
+                 f"前三名：{top3}。")
+    if _has(ql, "cpk", "capab", "parameter", "spc", "torque", "temp", "cure", "能力", "参数", "扭矩", "温度", "固化"):
         parts = []
         for col, s in SPECS.items():
             c, _ = cpk(u[col].to_numpy(), s["lsl"], s["usl"])
-            parts.append((c, s["label"]))
+            parts.append((c, i18n.SPEC_LABEL_ZH[col] if zh else s["label"]))
         parts.sort()
-        txt = "; ".join(f"{lbl}: Cpk {c:.2f}" for c, lbl in parts)
-        return f"{scope}, the least capable parameter is **{parts[0][1]}** (Cpk {parts[0][0]:.2f}; target ≥ 1.33). All: {txt}."
-    if any(k in ql for k in ["yield", "trend", "improve", "progress", "rty", "fpy"]):
+        txt = ("；" if zh else "; ").join(f"{lbl}: Cpk {c:.2f}" for c, lbl in parts)
+        return L(f"{scope}, the least capable parameter is **{parts[0][1]}** (Cpk {parts[0][0]:.2f}; target ≥ 1.33). All: {txt}.",
+                 f"{scope}，能力最差的参数是 **{parts[0][1]}**（Cpk {parts[0][0]:.2f}；目标 ≥ 1.33）。全部：{txt}。")
+    if _has(ql, "yield", "trend", "improve", "progress", "rty", "fpy", "良率", "趋势", "提升", "进展"):
         t = weekly_trend(data["units"], data["sr"])
-        first, last = t.iloc[0], t.iloc[-1]
-        return (f"Final yield went from **{first['final_yield']:.0%}** in week 1 to **{last['final_yield']:.0%}** in week 12 "
-                f"(FPY {first['fpy']:.0%} → {last['fpy']:.0%}; RTY {first['rty']:.0%} → {last['rty']:.0%}). "
-                "The biggest step-ups follow the week 5, 7 and 9 corrective actions.")
-    return ("I can answer questions about: worst line, top defect, worst supplier lot, day vs night shift, "
-            "yield trend, parameter capability (Cpk) and fixes made. Add 'week N' to scope a question.")
+        f, l = t.iloc[0], t.iloc[-1]
+        return L(f"Final yield went from **{f['final_yield']:.0%}** in week 1 to **{l['final_yield']:.0%}** in week 12 "
+                 f"(FPY {f['fpy']:.0%} → {l['fpy']:.0%}; RTY {f['rty']:.0%} → {l['rty']:.0%}). "
+                 "The biggest step-ups follow the week 5, 7 and 9 corrective actions.",
+                 f"最终良率从第 1 周的 **{f['final_yield']:.0%}** 提升到第 12 周的 **{l['final_yield']:.0%}**"
+                 f"（FPY {f['fpy']:.0%} → {l['fpy']:.0%}；RTY {f['rty']:.0%} → {l['rty']:.0%}）。"
+                 "最大的跃升紧跟在第 5、7、9 周的纠正措施之后。")
+    return L("I can answer questions about: worst line, top defect, worst supplier lot, day vs night shift, "
+             "yield trend, parameter capability (Cpk) and fixes made. Add 'week N' to scope a question.",
+             "我可以回答：最差产线、主要缺陷、最差供应商批次、白班 vs 夜班、良率趋势、参数能力（Cpk）、"
+             "已做的改进措施。加上“第 N 周”可以限定范围。")

@@ -17,13 +17,15 @@ streamlit run app.py           # opens http://localhost:8501
 ```
 
 If `./data` is missing, the app generates the data itself on first load.
+
+**Language / 语言:** the dashboard is bilingual. Use the **🌐 Language / 语言** switch in the sidebar, or open `http://localhost:8501/?lang=zh` for Chinese. You can also set `DEMO_LANG=zh` when you start the app. Every label, chart, takeaway, root-cause hint and Q&A answer is translated, and Q&A understands questions in either language. Defect codes and lot IDs stay as identifiers.
 To open the app on a particular page, set `DEMO_START_PAGE` to one of `overview`, `drilldown`, `pareto`, `spc`, `ai-insights` or `program`:
 
 ```bash
 DEMO_START_PAGE=ai-insights streamlit run app.py
 ```
 
-Smoke test. It opens every page and the main controls headlessly, and checks that all three root causes are found:
+Smoke test. It opens every page and the main controls headlessly in both English and Chinese, and checks that all three root causes are found:
 
 ```bash
 python tests/smoke_test.py
@@ -80,6 +82,7 @@ Output files: `data/station_results.csv`, `data/units.csv`, `data/fix_events.csv
 ```
 app.py              Streamlit UI (6 pages)
 analytics.py        metrics, SPC, anomaly detection, root-cause hints, DOE, Q&A
+i18n.py             English / Chinese display translations
 generate_data.py    synthetic data generator (numpy/pandas, fixed seed)
 tests/smoke_test.py headless test of every page and root-cause detection
 DEMO_SCRIPT.md      2-minute and 30-second talk tracks
