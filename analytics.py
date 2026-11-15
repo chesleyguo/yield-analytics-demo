@@ -53,8 +53,8 @@ KPI_DEFS = {
                     "通过全部 6 个工站（允许复测）的数量 ÷ 投入数量"),
     "fpy": ("Units passing all 6 stations on the first attempt, no retest ÷ units started",
             "6 个工站全部一次通过、无复测的数量 ÷ 投入数量"),
-    "rty": ("Product of the 6 station first-pass yields (≤ FPY when defects cluster on the same units)",
-            "6 个工站直通率的乘积（缺陷集中在同一批产品上时 ≤ FPY）"),
+    "rty": ("Product of the 6 station first-pass yields. Usually slightly below unit-level FPY, because defects tend to cluster on the same units.",
+            "6 个工站首次通过率的乘积。通常略低于整机 FPY，因为缺陷往往集中在同一批产品上。"),
     "dppm": ("Failed first-pass station tests ÷ all station tests × 1,000,000",
              "首次测试失败的工站测试数 ÷ 全部工站测试数 × 1,000,000"),
     "retest_rate": ("Station tests that failed first, then passed on retest ÷ all station tests",
@@ -99,7 +99,7 @@ def kpi_consistency(units: pd.DataFrame, sr: pd.DataFrame, tol: float = 1e-9) ->
         pooled = (s.groupby("station").size() * st_fpy).sum() / len(s)
         checks = {
             "RTY = product of station FPYs": abs(k["rty"] - st_fpy.prod()) < tol,
-            "RTY <= FPY (defects cluster on same units)": k["rty"] <= k["fpy"] + tol,
+            "FPY >= RTY (defects cluster on same units)": k["fpy"] >= k["rty"],
             "FPY <= final yield": k["fpy"] <= k["final_yield"] + tol,
             "RTY <= worst station FPY": k["rty"] <= st_fpy.min() + tol,
             "DPPM = (1 - pooled station FPY) x 1e6": abs(k["dppm"] - (1 - pooled) * 1e6) < 1e-3,

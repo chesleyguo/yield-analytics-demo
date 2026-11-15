@@ -52,6 +52,10 @@ data = A.load_data()
 problems = A.kpi_consistency(data["units"], data["sr"])
 print(f"{'ok  ' if not problems else 'FAIL'}  KPI consistency (all weeks): {problems or 'RTY ≤ FPY ≤ final yield; DPPM ↔ station FPY ↔ retest'}")
 failures += [("kpi", p_) for p_ in problems]
+for w, g in data["units"].groupby("week"):
+    k = A.kpis(g, data["sr"][data["sr"]["week"] == w])
+    assert k["fpy"] >= k["rty"], f"Week {w}: FPY {k['fpy']:.4f} < RTY {k['rty']:.4f}"
+print("ok    FPY >= RTY asserted for all 12 weeks")
 trend = A.weekly_trend(data["units"], data["sr"])
 w1, w12 = trend["final_yield"].iloc[0], trend["final_yield"].iloc[-1]
 story = 0.37 <= w1 <= 0.42 and 0.89 <= w12 <= 0.93
