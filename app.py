@@ -130,7 +130,7 @@ def pct(x, d=1):
 # --------------------------------------------------------------------------- data
 def _data_is_current() -> bool:
     import generate_data
-    stamp = A.DATA_DIR / "_generator_hash.txt"
+    stamp = A.DATA_DIR / "_data_version.txt"
     return ((A.DATA_DIR / "station_results.csv").exists() and stamp.exists()
             and stamp.read_text().strip() == generate_data.generator_hash())
 

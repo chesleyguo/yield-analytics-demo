@@ -337,7 +337,7 @@ def main(out_dir: str = "data") -> None:
     doe_results(rng).to_csv(out / "doe_results.csv", index=False)
 
     wk = units.groupby("week")["final_result"].apply(lambda s: (s == "PASS").mean())
-    (out / "_generator_hash.txt").write_text(generator_hash())
+    (out / "_data_version.txt").write_text(generator_hash())
     print(f"Units: {len(units):,}   station records: {len(sr):,}")
     print("Final yield by week:", " ".join(f"W{w}:{y:.0%}" for w, y in wk.items()))
     print(f"Wrote CSVs to {out.resolve()}")
